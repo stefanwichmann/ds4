@@ -10748,7 +10748,21 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (!strcmp(finish, "length")) {
+                /* The tool call is unterminated only because we hit max_tokens.
+                 * A recovery retry would run under the same budget and fail
+                 * again, and surfacing a malformed-DSML error leaks the retry's
+                 * prose into content. Report the truncation honestly as
+                 * finish=length so the caller can retry with a larger budget;
+                 * the partial tool markup is suppressed downstream. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s tool call truncated at max_tokens; returning finish=length",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+                trace_event(s, trace_id,
+                            "tool call truncated at max_tokens; returning finish=length");
+            } else if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
