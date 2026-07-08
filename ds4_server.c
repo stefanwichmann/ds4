@@ -10933,6 +10933,20 @@ decode_again:
         } else if (j->req.api == API_RESPONSES) {
             responses_live_clear(s);
         }
+
+        /* If a tool-error recovery retry was attempted but still produced no
+         * tool call AND the retry itself did not complete cleanly (truncated at
+         * max_tokens, or errored), any leftover content is the model reacting
+         * to the injected protocol reminder ("The previous tool call ..."),
+         * not a user-facing answer. Drop it so internal recovery text never
+         * leaks to the client. A cleanly finished retry (finish=stop) that
+         * answered in text is preserved. */
+        if (dsml_recovery_attempted && parsed_calls.len == 0 &&
+            parsed_content && parsed_content[0] &&
+            (!strcmp(final_finish, "length") || !strcmp(final_finish, "error"))) {
+            free(parsed_content);
+            parsed_content = xstrdup("");
+        }
     }
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
