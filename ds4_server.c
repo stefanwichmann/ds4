@@ -7435,6 +7435,21 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
     return true;
 }
 
+/* True when [p, p+len) is a proper prefix of a tool-call start marker — i.e. an
+ * unfinished marker the model was still emitting. Used on the final flush of a
+ * truncated stream to tell a partial tool call (drop it) from ordinary text
+ * that merely contains '<' (keep it). */
+static bool is_partial_tool_start_prefix(const char *p, size_t len) {
+    static const char *const markers[] = {
+        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_calls>",
+    };
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+        size_t ml = strlen(markers[i]);
+        if (len < ml && !strncmp(markers[i], p, len)) return true;
+    }
+    return false;
+}
+
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final) {
@@ -7471,6 +7486,23 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
                 }
             }
             limit = trim_tool_separator_ws(raw, start, limit);
+        } else {
+            /* Final flush of a (truncated) tool turn: there is no next chunk to
+             * re-evaluate held bytes, so a trailing partial tool-start marker
+             * would leak into content. Drop it — but only a genuine marker
+             * prefix, so ordinary text that merely contains '<' is preserved. */
+            const size_t max_marker = 80;
+            size_t scan = raw_len - start > max_marker ? raw_len - max_marker : start;
+            for (size_t i = raw_len; i > scan; i--) {
+                if (raw[i - 1] == '<') {
+                    size_t marker = i - 1;
+                    if (marker < limit &&
+                        is_partial_tool_start_prefix(raw + marker, raw_len - marker)) {
+                        limit = trim_tool_separator_ws(raw, start, marker);
+                    }
+                    break;
+                }
+            }
         }
     }
     return utf8_stream_safe_len(raw, start, limit, final);
