@@ -2679,8 +2679,29 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                     free(key);
                     goto bad;
                 }
-                tool_choice_none = !strcmp(choice, "none");
+                /* DS4 honours "none" (disable tools) and "auto" (model decides).
+                 * "required" and explicit function targets need constrained
+                 * decoding we do not implement -- reject so clients see the
+                 * limitation instead of silently downgrading to auto. */
+                if (!strcmp(choice, "none")) {
+                    tool_choice_none = true;
+                } else if (strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    chat_msgs_free(&msgs);
+                    free(tool_schemas);
+                    request_free(r);
+                    return false;
+                }
                 free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             } else if (!json_skip_value(&p)) {
                 free(key);
                 goto bad;
@@ -2875,7 +2896,24 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                             free(key);
                             goto bad;
                         }
-                        tool_choice_none = !strcmp(choice, "none");
+                        /* Anthropic: "auto"/"none" map to DS4 behaviour; "any"
+                         * and "tool" force a call, which needs constrained
+                         * decoding we do not implement -- reject instead of
+                         * silently downgrading to auto. */
+                        if (!strcmp(choice, "none")) {
+                            tool_choice_none = true;
+                        } else if (strcmp(choice, "auto") != 0) {
+                            snprintf(err, errlen,
+                                     "tool_choice.type=%s not supported", choice);
+                            free(choice);
+                            free(ckey);
+                            free(key);
+                            chat_msgs_free(&msgs);
+                            free(system);
+                            free(tool_schemas);
+                            request_free(r);
+                            return false;
+                        }
                         free(choice);
                     } else if (!json_skip_value(&p)) {
                         free(ckey);
@@ -13121,6 +13159,48 @@ static void test_reasoning_effort_mapping(void) {
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
+static void test_tool_choice_forcing_is_rejected(void) {
+    request r;
+    char err[256];
+
+    /* OpenAI: string "required" is not honoured -> 400, not a silent auto. */
+    err[0] = '\0';
+    TEST_ASSERT(!parse_chat_request(
+        NULL, NULL,
+        "{\"tool_choice\":\"required\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+
+    /* OpenAI: an explicit function target object is also rejected. */
+    err[0] = '\0';
+    TEST_ASSERT(!parse_chat_request(
+        NULL, NULL,
+        "{\"tool_choice\":{\"type\":\"function\","
+        "\"function\":{\"name\":\"get_weather\"}},"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+
+    /* Anthropic: type "any" (force some tool) is rejected. */
+    err[0] = '\0';
+    TEST_ASSERT(!parse_anthropic_request(
+        NULL, NULL,
+        "{\"tool_choice\":{\"type\":\"any\"},"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+
+    /* Anthropic: type "tool" (force a named tool) is rejected. */
+    err[0] = '\0';
+    TEST_ASSERT(!parse_anthropic_request(
+        NULL, NULL,
+        "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"get_weather\"},"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "not supported") != NULL);
+}
+
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
@@ -15942,6 +16022,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
+    test_tool_choice_forcing_is_rejected();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
