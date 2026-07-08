@@ -4704,6 +4704,32 @@ static const char *tool_parse_failure_recovery_finish(const char *finish) {
     return "stop";
 }
 
+/* Detect content that is really the start of a tool call the model never
+ * finished emitting. When a tool-enabled turn is truncated (finish=length)
+ * after </think> while a tool call was being emitted, the tail can be a partial
+ * DSML/XML start marker — either a proper prefix of a start marker
+ * ("<|DSML|tool_calls") or a full start marker whose block never closed.
+ * parse_generated_message_ex finds no parseable tool block and falls back to
+ * surfacing that fragment as content, which is wrong: it is an unfinished tool
+ * call, not an answer. */
+static bool content_is_truncated_tool_start(const char *s) {
+    if (!s) return false;
+    const char *p = skip_ascii_ws(s);
+    if (!*p) return false;
+    static const char *const markers[] = {
+        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_START_SHORT, "<tool_calls>",
+    };
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+        const char *m = markers[i];
+        /* A full start marker anywhere means a tool block that did not parse. */
+        if (strstr(p, m)) return true;
+        /* Remaining text is a proper prefix of a start marker -> partial. */
+        size_t pl = strlen(p);
+        if (pl < strlen(m) && !strncmp(p, m, pl)) return true;
+    }
+    return false;
+}
+
 static bool parse_generated_message_for_response(const char *text,
                                                  bool has_tools,
                                                  bool saw_tool_start,
@@ -4721,7 +4747,20 @@ static bool parse_generated_message_for_response(const char *text,
                                                 require_thinking_closed,
                                                 content_out, reasoning_out,
                                                 calls);
-    if (parsed_ok) return true;
+    if (parsed_ok) {
+        /* A tool-enabled turn truncated (finish=length) mid tool call leaves a
+         * partial DSML marker that parse_generated_message_ex surfaces as
+         * content. Drop it: it is an unfinished tool call, not an answer. The
+         * reasoning has already been split off correctly. */
+        const char *finish = finish_io && *finish_io ? *finish_io : "stop";
+        if (has_tools && !strcmp(finish, "length") &&
+            (!calls || calls->len == 0) &&
+            *content_out && content_is_truncated_tool_start(*content_out)) {
+            free(*content_out);
+            *content_out = xstrdup("");
+        }
+        return true;
+    }
 
     free(*content_out);
     free(*reasoning_out);
@@ -13634,6 +13673,39 @@ static void test_thinking_unclosed_is_reasoning_not_content(void) {
     tool_calls_free(&calls);
 }
 
+static void test_truncated_tool_start_not_leaked_as_content(void) {
+    /* A tool-enabled turn truncated (finish=length) after </think> while the
+     * model was starting a tool call leaves a partial DSML start marker. It
+     * must not surface as assistant content — it is an unfinished tool call,
+     * not an answer. The reasoning stays intact. */
+    const char *generated =
+        "<think>need calc</think>\n\n<" DS4_DSML "tool_calls";  /* no closing '>' */
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "length";
+    bool recovered = false;
+
+    TEST_ASSERT(parse_generated_message_for_response(generated,
+                                                     true,   /* has_tools */
+                                                     true,   /* saw_tool_start */
+                                                     true,   /* require_thinking_closed */
+                                                     &finish,
+                                                     err, sizeof(err),
+                                                     &content, &reasoning,
+                                                     &calls, &recovered));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need calc"));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(!strcmp(finish, "length"));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
@@ -15831,6 +15903,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_truncated_tool_start_not_leaked_as_content();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
